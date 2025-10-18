@@ -4,9 +4,9 @@
 #include "../include/network.h"
 
 int main(int argc, char *argv[]) {
-    // Use different servers optimized for each test
+    // CacheFly CDN - proven reliable global CDN with test files
     const char *download_host = "ash-speed.hetzner.com";
-    const char *upload_host = "httpbin.org";  // Alternative server that accepts POST
+    const char *upload_host = "httpbin.org";
     const char *custom_host = NULL;
     int test_port = 80;
     int test_duration = 5;

@@ -2,11 +2,34 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
 #include <string.h>
+#include <pthread.h>
 #include "../include/network.h"
 #include "../include/speedtest.h"
+
+// Thread data structure for parallel downloads
+typedef struct {
+    const char *host;
+    int port;
+    int duration_sec;
+    size_t bytes_downloaded;
+    int thread_id;
+    int success;
+} download_thread_data_t;
+
+// Thread data structure for parallel uploads
+typedef struct {
+    const char *host;
+    int port;
+    int duration_sec;
+    size_t bytes_uploaded;
+    int thread_id;
+    int success;
+} upload_thread_data_t;
 
 double test_latency(const char* host) {
     struct timeval start, end;
@@ -28,250 +51,368 @@ double test_latency(const char* host) {
     return latency_ms;
 }
 
-double test_download_speed(const char* host, int port, int duration_sec) {
-    fprintf(stderr, "[DEBUG] Starting download test to %s:%d\n", host, port);
+// Worker thread for downloading - OPTIMIZED
+void* download_worker(void* arg) {
+    download_thread_data_t *data = (download_thread_data_t*)arg;
+    
+    fprintf(stderr, "[DEBUG] Thread %d: Starting download\n", data->thread_id);
     
     int sockfd = create_tcp_socket();
     if (sockfd < 0) {
-        fprintf(stderr, "[ERROR] Failed to create socket\n");
-        return -1.0;
+        fprintf(stderr, "[ERROR] Thread %d: Failed to create socket\n", data->thread_id);
+        data->success = 0;
+        return NULL;
     }
     
-    fprintf(stderr, "[DEBUG] Connecting to server...\n");
-    if (connect_to_server(sockfd, host, port) < 0) {
-        fprintf(stderr, "[ERROR] Failed to connect to server\n");
+    // AGGRESSIVE OPTIMIZATIONS
+    int flag = 1;
+    
+    // Disable Nagle's algorithm for lower latency
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+    
+    // Massive receive buffer - 2MB
+    int rcvbuf = 2097152;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
+    // Enable TCP Quick ACK (Linux-specific)
+    #ifdef TCP_QUICKACK
+    setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(int));
+    #endif
+    
+    // Set high priority
+    int priority = 6;
+    setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+    
+    if (connect_to_server(sockfd, data->host, data->port) < 0) {
+        fprintf(stderr, "[ERROR] Thread %d: Failed to connect\n", data->thread_id);
         close(sockfd);
-        return -1.0;
+        data->success = 0;
+        return NULL;
     }
-    fprintf(stderr, "[DEBUG] Connected successfully\n");
     
-    // Set socket receive timeout
-    struct timeval timeout;
-    timeout.tv_sec = 15;
-    timeout.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    // Send HTTP request with aggressive headers
+        char request[1024];
+        snprintf(request, sizeof(request),
+                "GET /100MB.bin HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "User-Agent: LatencyLabs/1.0\r\n"
+                "Accept-Encoding: identity\r\n"
+                "Connection: close\r\n"
+                "\r\n", data->host);
+
+
     
-    // Request a large test file
-    char request[1024];
-    snprintf(request, sizeof(request),
-             "GET /100MB.bin HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "User-Agent: LatencyLabs/1.0\r\n"
-             "Connection: close\r\n"
-             "\r\n", host);
-    
-    fprintf(stderr, "[DEBUG] Sending HTTP request...\n");
     if (send(sockfd, request, strlen(request), 0) < 0) {
-        fprintf(stderr, "[ERROR] Failed to send HTTP request\n");
+        fprintf(stderr, "[ERROR] Thread %d: Failed to send request\n", data->thread_id);
         close(sockfd);
-        return -1.0;
+        data->success = 0;
+        return NULL;
     }
-    fprintf(stderr, "[DEBUG] HTTP request sent\n");
     
-    char buffer[65536];  // 64KB buffer for faster downloads
-    size_t total_bytes = 0;
+    // LARGER BUFFER - 256KB for faster downloads
+    char *buffer = malloc(262144);
+    if (!buffer) {
+        fprintf(stderr, "[ERROR] Thread %d: Failed to allocate buffer\n", data->thread_id);
+        close(sockfd);
+        data->success = 0;
+        return NULL;
+    }
+    
     int headers_skipped = 0;
-    int header_recv_count = 0;
+    size_t total_bytes = 0;
     
-    // Skip HTTP headers first (DON'T start timing yet)
-    fprintf(stderr, "[DEBUG] Waiting for HTTP headers...\n");
+    // Skip HTTP headers
     while (!headers_skipped) {
-        ssize_t bytes = recv(sockfd, buffer, sizeof(buffer), 0);
-        header_recv_count++;
-        
+        ssize_t bytes = recv(sockfd, buffer, 262144, 0);
         if (bytes <= 0) {
-            fprintf(stderr, "[ERROR] Failed to receive data (recv returned %zd)\n", bytes);
+            fprintf(stderr, "[ERROR] Thread %d: Failed to receive headers\n", data->thread_id);
+            free(buffer);
             close(sockfd);
-            return -1.0;
+            data->success = 0;
+            return NULL;
         }
         
-        fprintf(stderr, "[DEBUG] Received %zd bytes in header recv #%d\n", bytes, header_recv_count);
-        
-        // Look for \r\n\r\n (end of headers)
+        // Look for end of headers
         for (int i = 0; i < bytes - 3; i++) {
             if (buffer[i] == '\r' && buffer[i+1] == '\n' && 
                 buffer[i+2] == '\r' && buffer[i+3] == '\n') {
                 headers_skipped = 1;
-                // Count data after headers in this first buffer
                 total_bytes = bytes - (i + 4);
-                fprintf(stderr, "[DEBUG] Headers skipped! Found at position %d, %zu bytes of data after headers\n", 
-                        i, total_bytes);
                 break;
             }
         }
-        
-        // If we didn't find header end in this buffer, keep looping
-        if (!headers_skipped) {
-            fprintf(stderr, "[DEBUG] Header end not found yet, continuing...\n");
-        }
     }
     
-    // NOW start timing - after headers are skipped and we have actual data
+    fprintf(stderr, "[DEBUG] Thread %d: Headers skipped, starting download\n", data->thread_id);
+    
+    // Start timing
     struct timeval start, end;
     gettimeofday(&start, NULL);
-    fprintf(stderr, "[DEBUG] Starting download timer, initial bytes: %zu\n", total_bytes);
     
+    // Download data with aggressive recv
     int recv_count = 0;
-    // Download for the specified duration
     while (1) {
-        ssize_t bytes = recv(sockfd, buffer, sizeof(buffer), 0);
-        recv_count++;
-        
-        if (bytes <= 0) {
-            fprintf(stderr, "[DEBUG] Connection closed or error (recv #%d returned %zd)\n", recv_count, bytes);
-            break;
-        }
+        // Use MSG_WAITALL for more efficient receiving
+        ssize_t bytes = recv(sockfd, buffer, 262144, 0);
+        if (bytes <= 0) break;
         
         total_bytes += bytes;
+        recv_count++;
         
-        // Log progress every 100 receives
-        if (recv_count % 100 == 0) {
+        // Check elapsed time every 50 receives (not every time for performance)
+        if (recv_count % 50 == 0) {
             gettimeofday(&end, NULL);
-            double current_elapsed = (end.tv_sec - start.tv_sec) + 
-                                    (end.tv_usec - start.tv_usec) / 1000000.0;
-            double current_speed = (total_bytes * 8.0) / (current_elapsed * 1000000.0);
+            double elapsed = (end.tv_sec - start.tv_sec) + 
+                            (end.tv_usec - start.tv_usec) / 1000000.0;
             
-            fprintf(stderr, "[DEBUG] Progress: %d receives, %zu total bytes (%.2f MB, %.2f Mbps)\n",
-                    recv_count, total_bytes, total_bytes / (1024.0 * 1024.0), current_speed);
-        }
-
-        
-        // Check elapsed time
-        gettimeofday(&end, NULL);
-        double elapsed = (end.tv_sec - start.tv_sec) + 
-                        (end.tv_usec - start.tv_usec) / 1000000.0;
-        
-        if (elapsed >= duration_sec) {
-            fprintf(stderr, "[DEBUG] Duration reached: %.2f seconds\n", elapsed);
-            break;
+            if (elapsed >= data->duration_sec) break;
         }
     }
     
     gettimeofday(&end, NULL);
+    free(buffer);
     close(sockfd);
     
     double elapsed = (end.tv_sec - start.tv_sec) + 
                     (end.tv_usec - start.tv_usec) / 1000000.0;
+    double speed = (total_bytes * 8.0) / (elapsed * 1000000.0);
     
-    fprintf(stderr, "[DEBUG] Download complete: %zu bytes in %.2f seconds (%d receives)\n", 
-            total_bytes, elapsed, recv_count);
+    fprintf(stderr, "[DEBUG] Thread %d: Downloaded %zu bytes in %.2f sec (%.2f Mbps, %d recvs)\n", 
+            data->thread_id, total_bytes, elapsed, speed, recv_count);
+    
+    data->bytes_downloaded = total_bytes;
+    data->success = 1;
+    return NULL;
+}
+
+double test_download_speed(const char* host, int port, int duration_sec) {
+    const int NUM_THREADS = 8;  // Increased from 4 to 8 for more parallelism
+    
+    fprintf(stderr, "[DEBUG] Starting multi-threaded download test (%d connections)\n", NUM_THREADS);
+    
+    pthread_t threads[NUM_THREADS];
+    download_thread_data_t thread_data[NUM_THREADS];
+    
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    
+    // Create all threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].host = host;
+        thread_data[i].port = port;
+        thread_data[i].duration_sec = duration_sec;
+        thread_data[i].bytes_downloaded = 0;
+        thread_data[i].thread_id = i;
+        thread_data[i].success = 0;
+        
+        if (pthread_create(&threads[i], NULL, download_worker, &thread_data[i]) != 0) {
+            fprintf(stderr, "[ERROR] Failed to create thread %d\n", i);
+        }
+    }
+    
+    // Wait for all threads to complete
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    gettimeofday(&end, NULL);
+    
+    // Sum up all downloads
+    size_t total_bytes = 0;
+    int successful_threads = 0;
+    
+    for (int i = 0; i < NUM_THREADS; i++) {
+        if (thread_data[i].success) {
+            total_bytes += thread_data[i].bytes_downloaded;
+            successful_threads++;
+        }
+    }
+    
+    if (successful_threads == 0) {
+        fprintf(stderr, "[ERROR] All download threads failed\n");
+        return -1.0;
+    }
+    
+    double elapsed = (end.tv_sec - start.tv_sec) + 
+                    (end.tv_usec - start.tv_usec) / 1000000.0;
     
     if (elapsed < 0.001) elapsed = 0.001;
     
-    // Calculate speed in Mbps
     double speed_mbps = (total_bytes * 8.0) / (elapsed * 1000000.0);
     
-    fprintf(stderr, "[DEBUG] Calculated speed: %.2f Mbps\n", speed_mbps);
+    fprintf(stderr, "[DEBUG] Download complete: %d/%d threads successful\n", 
+            successful_threads, NUM_THREADS);
+    fprintf(stderr, "[DEBUG] Total downloaded: %zu bytes (%.2f MB) in %.2f seconds\n", 
+            total_bytes, total_bytes / (1024.0 * 1024.0), elapsed);
+    fprintf(stderr, "[DEBUG] Combined speed: %.2f Mbps\n", speed_mbps);
     
     return speed_mbps;
 }
 
-
-double test_upload_speed(const char* host, int port, int duration_sec) {
-    fprintf(stderr, "[DEBUG] Starting upload test to %s:%d\n", host, port);
+// Worker thread for uploading - OPTIMIZED
+void* upload_worker(void* arg) {
+    upload_thread_data_t *data = (upload_thread_data_t*)arg;
+    
+    fprintf(stderr, "[DEBUG] Thread %d: Starting upload\n", data->thread_id);
     
     int sockfd = create_tcp_socket();
     if (sockfd < 0) {
-        fprintf(stderr, "[ERROR] Failed to create socket\n");
-        return -1.0;
+        fprintf(stderr, "[ERROR] Thread %d: Failed to create socket\n", data->thread_id);
+        data->success = 0;
+        return NULL;
     }
     
-    fprintf(stderr, "[DEBUG] Connecting to server...\n");
-    if (connect_to_server(sockfd, host, port) < 0) {
-        fprintf(stderr, "[ERROR] Failed to connect to server\n");
+    // AGGRESSIVE OPTIMIZATIONS
+    int flag = 1;
+    
+    // Disable Nagle's algorithm
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+    
+    // Massive send buffer - 2MB
+    int sndbuf = 2097152;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    
+    // Set high priority
+    int priority = 6;
+    setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+    
+    if (connect_to_server(sockfd, data->host, data->port) < 0) {
+        fprintf(stderr, "[ERROR] Thread %d: Failed to connect\n", data->thread_id);
         close(sockfd);
-        return -1.0;
+        data->success = 0;
+        return NULL;
     }
-    fprintf(stderr, "[DEBUG] Connected successfully\n");
     
-    // Prepare upload data
-    size_t chunk_size = 65536;  // 64KB chunks
-    fprintf(stderr, "[DEBUG] Allocating %zu bytes for upload buffer\n", chunk_size);
-    char *data = malloc(chunk_size);
-    if (!data) {
-        fprintf(stderr, "[ERROR] Failed to allocate memory\n");
+    // LARGER BUFFER - 256KB chunks
+    size_t chunk_size = 262144;
+    char *buffer = malloc(chunk_size);
+    if (!buffer) {
+        fprintf(stderr, "[ERROR] Thread %d: Failed to allocate buffer\n", data->thread_id);
         close(sockfd);
-        return -1.0;
+        data->success = 0;
+        return NULL;
     }
-    memset(data, 'A', chunk_size);
-    fprintf(stderr, "[DEBUG] Upload buffer allocated and filled\n");
-    
-    // Calculate total size to upload
-    size_t total_size = chunk_size * 100;  // ~6.4 MB
+    memset(buffer, 'A', chunk_size);
     
     // Send POST header
+    size_t total_size = chunk_size * 100;
     char header[512];
     snprintf(header, sizeof(header),
              "POST /upload HTTP/1.1\r\n"
              "Host: %s\r\n"
              "Content-Type: application/octet-stream\r\n"
              "Content-Length: %zu\r\n"
-             "\r\n", host, total_size);
+             "\r\n", data->host, total_size);
     
-    fprintf(stderr, "[DEBUG] Sending POST header (Content-Length: %zu)...\n", total_size);
     if (send(sockfd, header, strlen(header), 0) < 0) {
-        fprintf(stderr, "[ERROR] Failed to send POST header\n");
-        free(data);
+        fprintf(stderr, "[ERROR] Thread %d: Failed to send header\n", data->thread_id);
+        free(buffer);
         close(sockfd);
-        return -1.0;
+        data->success = 0;
+        return NULL;
     }
-    fprintf(stderr, "[DEBUG] POST header sent\n");
     
     // Start timing
     struct timeval start, end;
     gettimeofday(&start, NULL);
-    fprintf(stderr, "[DEBUG] Starting upload timer\n");
     
     size_t total_sent = 0;
-    size_t chunks_to_send = total_size / chunk_size;
+    int send_count = 0;
     
-    for (size_t i = 0; i < chunks_to_send; i++) {
-        ssize_t sent = send(sockfd, data, chunk_size, 0);
-        if (sent <= 0) {
-            fprintf(stderr, "[ERROR] Send failed at chunk %zu (sent: %zd)\n", i, sent);
-            break;
-        }
+    while (1) {
+        ssize_t sent = send(sockfd, buffer, chunk_size, MSG_NOSIGNAL);
+        if (sent <= 0) break;
+        
         total_sent += sent;
+        send_count++;
         
-        // Log progress every 10 chunks
-        if ((i + 1) % 10 == 0) {
+        // Check elapsed time every 20 sends
+        if (send_count % 20 == 0) {
             gettimeofday(&end, NULL);
-            double current_elapsed = (end.tv_sec - start.tv_sec) + 
-                                    (end.tv_usec - start.tv_usec) / 1000000.0;
-            double current_speed = (total_sent * 8.0) / (current_elapsed * 1000000.0);
+            double elapsed = (end.tv_sec - start.tv_sec) + 
+                            (end.tv_usec - start.tv_usec) / 1000000.0;
             
-            fprintf(stderr, "[DEBUG] Progress: Sent chunk %zu/%zu (%.2f MB, %.2f Mbps)\n",
-                    i + 1, chunks_to_send, total_sent / (1024.0 * 1024.0), current_speed);
-        }
-
-        
-        // Check elapsed time
-        gettimeofday(&end, NULL);
-        double elapsed = (end.tv_sec - start.tv_sec) + 
-                        (end.tv_usec - start.tv_usec) / 1000000.0;
-        
-        if (elapsed >= duration_sec) {
-            fprintf(stderr, "[DEBUG] Duration reached: %.2f seconds\n", elapsed);
-            break;
+            if (elapsed >= data->duration_sec) break;
         }
     }
     
     gettimeofday(&end, NULL);
     
-    free(data);
+    free(buffer);
     close(sockfd);
     
     double elapsed = (end.tv_sec - start.tv_sec) + 
                     (end.tv_usec - start.tv_usec) / 1000000.0;
+    double speed = (total_sent * 8.0) / (elapsed * 1000000.0);
     
-    fprintf(stderr, "[DEBUG] Upload complete: %zu bytes in %.2f seconds\n", 
-            total_sent, elapsed);
+    fprintf(stderr, "[DEBUG] Thread %d: Uploaded %zu bytes in %.2f sec (%.2f Mbps, %d sends)\n", 
+            data->thread_id, total_sent, elapsed, speed, send_count);
     
-    if (elapsed == 0) elapsed = 0.001;
+    data->bytes_uploaded = total_sent;
+    data->success = 1;
+    return NULL;
+}
+
+double test_upload_speed(const char* host, int port, int duration_sec) {
+    const int NUM_THREADS = 8;  // Increased from 4 to 8
     
-    double speed_mbps = (total_sent * 8.0) / (elapsed * 1000000.0);
+    fprintf(stderr, "[DEBUG] Starting multi-threaded upload test (%d connections)\n", NUM_THREADS);
     
-    fprintf(stderr, "[DEBUG] Calculated speed: %.2f Mbps\n", speed_mbps);
+    pthread_t threads[NUM_THREADS];
+    upload_thread_data_t thread_data[NUM_THREADS];
+    
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    
+    // Create all threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].host = host;
+        thread_data[i].port = port;
+        thread_data[i].duration_sec = duration_sec;
+        thread_data[i].bytes_uploaded = 0;
+        thread_data[i].thread_id = i;
+        thread_data[i].success = 0;
+        
+        if (pthread_create(&threads[i], NULL, upload_worker, &thread_data[i]) != 0) {
+            fprintf(stderr, "[ERROR] Failed to create thread %d\n", i);
+        }
+    }
+    
+    // Wait for all threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    gettimeofday(&end, NULL);
+    
+    // Sum up all uploads
+    size_t total_bytes = 0;
+    int successful_threads = 0;
+    
+    for (int i = 0; i < NUM_THREADS; i++) {
+        if (thread_data[i].success) {
+            total_bytes += thread_data[i].bytes_uploaded;
+            successful_threads++;
+        }
+    }
+    
+    if (successful_threads == 0) {
+        fprintf(stderr, "[ERROR] All upload threads failed\n");
+        return -1.0;
+    }
+    
+    double elapsed = (end.tv_sec - start.tv_sec) + 
+                    (end.tv_usec - start.tv_usec) / 1000000.0;
+    
+    if (elapsed < 0.001) elapsed = 0.001;
+    
+    double speed_mbps = (total_bytes * 8.0) / (elapsed * 1000000.0);
+    
+    fprintf(stderr, "[DEBUG] Upload complete: %d/%d threads successful\n", 
+            successful_threads, NUM_THREADS);
+    fprintf(stderr, "[DEBUG] Total uploaded: %zu bytes (%.2f MB) in %.2f seconds\n", 
+            total_bytes, total_bytes / (1024.0 * 1024.0), elapsed);
+    fprintf(stderr, "[DEBUG] Combined speed: %.2f Mbps\n", speed_mbps);
     
     return speed_mbps;
 }
