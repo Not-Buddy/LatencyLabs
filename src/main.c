@@ -4,13 +4,15 @@
 #include "../include/network.h"
 
 int main(int argc, char *argv[]) {
-    const char *test_host = "speedtest.net";
+    // Use different servers optimized for each test
+    const char *download_host = "ash-speed.hetzner.com";
+    const char *upload_host = "httpbin.org";  // Alternative server that accepts POST
+    const char *custom_host = NULL;
     int test_port = 80;
     int test_duration = 5;
     
-    // Allow custom host from command line
     if (argc > 1) {
-        test_host = argv[1];
+        custom_host = argv[1];
     }
     
     printf("========================================\n");
@@ -18,23 +20,34 @@ int main(int argc, char *argv[]) {
     printf("========================================\n\n");
     
     // Test latency
-    printf("Testing latency to %s...\n", test_host);
-    double latency = test_latency(test_host);
+    const char *latency_host = custom_host ? custom_host : "google.com";
+    printf("Testing latency to %s...\n", latency_host);
+    double latency = test_latency(latency_host);
     if (latency < 0) {
         printf("✗ Latency test failed\n\n");
     } else {
         printf("✓ Latency: %.2f ms\n\n", latency);
     }
     
-    // Test download speed
-    printf("Testing download speed (duration: %d seconds)...\n", test_duration);
-    double download_speed = test_download_speed(test_host, test_port, test_duration);
-    printf("✓ Download Speed: %.2f Mbps\n\n", download_speed);
+    // Download test
+    printf("Testing download speed from %s (duration: %d seconds)...\n", 
+           download_host, test_duration);
+    double download_speed = test_download_speed(download_host, test_port, test_duration);
+    if (download_speed < 0) {
+        printf("✗ Download test failed\n\n");
+    } else {
+        printf("✓ Download Speed: %.2f Mbps\n\n", download_speed);
+    }
     
-    // Test upload speed
-    printf("Testing upload speed (duration: %d seconds)...\n", test_duration);
-    double upload_speed = test_upload_speed(test_host, test_port, test_duration);
-    printf("✓ Upload Speed: %.2f Mbps\n\n", upload_speed);
+    // Upload test
+    printf("Testing upload speed to %s (duration: %d seconds)...\n", 
+           upload_host, test_duration);
+    double upload_speed = test_upload_speed(upload_host, test_port, test_duration);
+    if (upload_speed < 0) {
+        printf("✗ Upload test failed\n\n");
+    } else {
+        printf("✓ Upload Speed: %.2f Mbps\n\n", upload_speed);
+    }
     
     printf("========================================\n");
     printf("Test completed!\n");
