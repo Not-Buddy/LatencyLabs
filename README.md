@@ -53,6 +53,48 @@ LatencyLabs/
 └── README.md           # This file
 ```
 
+```mermaid
+graph TD
+    subgraph OSI Layers
+        L7[Application Layer]
+        L6[Presentation Layer]
+        L5[Session Layer]
+        L4[Transport Layer]
+        L3[Network Layer]
+        L2[Data Link Layer]
+        L1[Physical Layer]
+    end
+
+    subgraph LatencyLabs Components
+        Main["main.c: Test Orchestration"]
+        LatencyTest["Latency Test (TCP connect time)"]
+        DownloadTest["Download Speed Test (Multi-threaded TCP GET)"]
+        UploadTest["Upload Speed Test (Multi-threaded TCP POST)"]
+        SocketUtils["Socket Utilities (connect, send, recv)"]
+    end
+
+    %% Application Layer: HTTP Requests & Test Logic
+    L7 --> Main
+    L7 --> LatencyTest
+    L7 --> DownloadTest
+    L7 --> UploadTest
+
+    %% Transport Layer: TCP Socket operations
+    L4 --> SocketUtils
+
+    %% Network / Data Link / Physical handled by OS networking stack
+    L3 --> OSNetworking["OS Network Stack"]
+    L2 --> OSNetworking
+    L1 --> OSNetworking
+
+    %% Links
+    LatencyTest --> SocketUtils
+    DownloadTest --> SocketUtils
+    UploadTest --> SocketUtils
+
+    SocketUtils --> OSNetworking
+
+```
 
 ## Usage
 
